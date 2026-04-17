@@ -130,6 +130,13 @@ def main():
         "--user-agent",
         help="User-Agent to use for downloading file.",
     )
+    parser.add_argument(
+        "--api-key",
+        help="(folder only) Google Drive API key. Enables full folder listing "
+        "via the Drive API v3, bypassing the {max}-file HTML scraping limit. "
+        "Requires the folder to be publicly shared and the API key to have "
+        "Drive API enabled in Google Cloud Console.".format(max=MAX_NUMBER_FILES),
+    )
 
     args = parser.parse_args()
 
@@ -167,6 +174,7 @@ def main():
                 remaining_ok=args.remaining_ok,
                 user_agent=args.user_agent,
                 resume=args.continue_,
+                api_key=args.api_key,
             )
         else:
             download(

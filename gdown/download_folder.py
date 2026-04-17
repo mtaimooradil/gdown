@@ -32,6 +32,86 @@ class _GoogleDriveFile(object):
         return self.type == self.TYPE_FOLDER
 
 
+def _list_folder_contents_via_api(sess, folder_id, api_key, quiet=False):
+    """List all files in a Google Drive folder using the Drive API v3.
+
+    Handles pagination automatically, so folders with more than 50 files
+    are fully enumerated. Requires a valid API key for public folders.
+
+    Returns a list of (id, name, mimeType) tuples.
+    """
+    endpoint = "https://www.googleapis.com/drive/v3/files"
+    params = {
+        "q": "'{fid}' in parents and trashed=false".format(fid=folder_id),
+        "key": api_key,
+        "fields": "nextPageToken,files(id,name,mimeType)",
+        "pageSize": 1000,
+    }
+
+    items = []
+    page = 1
+    while True:
+        res = sess.get(endpoint, params=params)
+        if res.status_code == 400:
+            raise RuntimeError(
+                "Drive API returned 400 Bad Request. "
+                "Check that your API key is valid and the Drive API is enabled."
+            )
+        if res.status_code == 403:
+            raise RuntimeError(
+                "Drive API returned 403 Forbidden. "
+                "Ensure the folder is shared publicly and the API key has Drive API access."
+            )
+        if res.status_code != 200:
+            raise RuntimeError(
+                "Drive API request failed with status {}.".format(res.status_code)
+            )
+
+        data = res.json()
+        page_items = data.get("files", [])
+        items.extend(page_items)
+        if not quiet:
+            print(
+                "Retrieved page {page} ({n} items, {total} total)".format(
+                    page=page, n=len(page_items), total=len(items)
+                ),
+                file=sys.stderr,
+            )
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+        params["pageToken"] = next_page_token
+        page += 1
+
+    return [(f["id"], f["name"], f["mimeType"]) for f in items]
+
+
+def _build_gdrive_tree_via_api(sess, folder_id, folder_name, api_key, quiet=False):
+    """Recursively build a _GoogleDriveFile tree using the Drive API."""
+    gdrive_file = _GoogleDriveFile(
+        id=folder_id,
+        name=folder_name,
+        type=_GoogleDriveFile.TYPE_FOLDER,
+    )
+
+    items = _list_folder_contents_via_api(sess, folder_id, api_key, quiet=quiet)
+    for child_id, child_name, child_mime in items:
+        if child_mime == _GoogleDriveFile.TYPE_FOLDER:
+            if not quiet:
+                print("Retrieving folder", child_id, child_name)
+            child = _build_gdrive_tree_via_api(
+                sess, child_id, child_name, api_key, quiet=quiet
+            )
+        else:
+            if not quiet:
+                print("Processing file", child_id, child_name)
+            child = _GoogleDriveFile(id=child_id, name=child_name, type=child_mime)
+        gdrive_file.children.append(child)
+
+    return gdrive_file
+
+
 def _parse_google_drive_file(url, content):
     """Extracts information about the current page file and its children."""
 
@@ -80,7 +160,7 @@ def _parse_google_drive_file(url, content):
         )
 
     gdrive_file = _GoogleDriveFile(
-        id=url.split("/")[-1],
+        id=url.split("/")[-1].split("?")[0],
         name=name,
         type=_GoogleDriveFile.TYPE_FOLDER,
     )
@@ -210,6 +290,7 @@ def download_folder(
     user_agent=None,
     skip_download: bool = False,
     resume=False,
+    api_key=None,
 ) -> Union[List[str], List[GoogleDriveFileToDownload], None]:
     """Downloads entire folder from URL.
 
@@ -245,6 +326,11 @@ def download_folder(
         Completed output files will be skipped.
         Partial tempfiles will be reused, if the transfer is incomplete.
         Default is False.
+    api_key: str, optional
+        Google Drive API key. When provided, uses the Drive API v3 for folder
+        listing, which supports unlimited files (no 50-file cap). The folder
+        must be publicly shared and the API key must have Drive API enabled.
+        Without this, falls back to HTML scraping (max 50 files per folder).
 
     Returns
     -------
@@ -272,16 +358,37 @@ def download_folder(
 
     if not quiet:
         print("Retrieving folder contents", file=sys.stderr)
-    is_success, gdrive_file = _download_and_parse_google_drive_link(
-        sess,
-        url,
-        quiet=quiet,
-        remaining_ok=remaining_ok,
-        verify=verify,
-    )
-    if not is_success:
-        print("Failed to retrieve folder contents", file=sys.stderr)
-        return None
+
+    if api_key is not None:
+        # Extract folder ID from URL
+        folder_id = url.rstrip("/").split("/")[-1].split("?")[0]
+        # Fetch the folder name via the API so we can name the output directory
+        meta_res = sess.get(
+            "https://www.googleapis.com/drive/v3/files/{fid}".format(fid=folder_id),
+            params={"key": api_key, "fields": "name"},
+        )
+        if meta_res.status_code != 200:
+            print(
+                "Failed to retrieve folder metadata via API "
+                "(status {})".format(meta_res.status_code),
+                file=sys.stderr,
+            )
+            return None
+        folder_name = meta_res.json().get("name", folder_id)
+        gdrive_file = _build_gdrive_tree_via_api(
+            sess, folder_id, folder_name, api_key, quiet=quiet
+        )
+    else:
+        is_success, gdrive_file = _download_and_parse_google_drive_link(
+            sess,
+            url,
+            quiet=quiet,
+            remaining_ok=remaining_ok,
+            verify=verify,
+        )
+        if not is_success:
+            print("Failed to retrieve folder contents", file=sys.stderr)
+            return None
 
     if not quiet:
         print("Retrieving folder contents completed", file=sys.stderr)
@@ -322,8 +429,15 @@ def download_folder(
                 files.append(local_path)
                 continue
 
+            if api_key is not None:
+                file_url = (
+                    "https://www.googleapis.com/drive/v3/files/{id}"
+                    "?alt=media&key={key}".format(id=id, key=api_key)
+                )
+            else:
+                file_url = "https://drive.google.com/uc?id=" + id
             local_path = download(
-                url="https://drive.google.com/uc?id=" + id,
+                url=file_url,
                 output=local_path,
                 quiet=quiet,
                 proxy=proxy,
